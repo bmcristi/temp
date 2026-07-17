@@ -1,0 +1,82 @@
+{
+  "[dockercompose]": {
+    "editor.autoIndent": "advanced",
+    "editor.defaultFormatter": "redhat.vscode-yaml",
+    "editor.insertSpaces": true,
+    "editor.tabSize": 2
+  },
+  "[github-actions-workflow]": {
+    "editor.defaultFormatter": "redhat.vscode-yaml"
+  },
+  "[python]": {
+    "editor.codeActionsOnSave": {
+      "source.fixAll": "explicit",
+      "source.organizeImports": "explicit"
+    },
+    "editor.formatOnSave": true
+  },
+  "black-formatter.importStrategy": "fromEnvironment",
+  "claudeCode.preferredLocation": "panel",
+  "dbcode.connections": [
+    {
+      "connectionId": "9laiVikJfsmeqVxeefn0X",
+      "connectionType": "socket",
+      "driver": "duckdb",
+      "driverOptions": {
+        "extensions": [],
+        "fileSearchPath": "database"
+      },
+      "name": "test",
+      "pinnedConnectionTimeout": "0",
+      "postConnectionSqlType": "inline",
+      "readOnly": false,
+      "socket": "/Users/cboizas/personal/personal_projects/polymarket/trade_scanner/.tmp/lucian_data/blockchain_data.duckdb"
+    }
+  ],
+  "dbcode.resultLocation": "below",
+  "diffEditor.renderSideBySide": true,
+  "diffEditor.useInlineViewWhenSpaceIsLimited": false,
+  "editor.defaultFoldingRangeProvider": "ms-python.black-formatter",
+  "editor.formatOnSave": true,
+  "explorer.compactFolders": false,
+  "files.autoSave": "afterDelay",
+  "files.autoSaveDelay": 300,
+  "files.exclude": {
+    "**/*.pyc": true,
+    "**/__pycache__": true
+  },
+  "git.autofetch": true,
+  "python.analysis.extraPaths": [
+    "."
+  ],
+  "python.analysis.autoImportCompletions": true,
+  "python.analysis.fixAll": [
+    "source.unusedImports"
+  ],
+  "python.analysis.indexing": true,
+  "python.createEnvironment.trigger": "off",
+  "python.analysis.updateImportsOnFileMove.enabled": "always",
+  "redhat.telemetry.enabled": true,
+  "terminal.integrated.copyOnSelection": true,
+  "window.commandCenter": 1,
+  "workbench.colorCustomizations": {
+    "gitDecoration.addedResourceForeground": "#4CAF50",
+    "gitDecoration.modifiedResourceForeground": "#2196F3",
+    "gitDecoration.untrackedResourceForeground": "#f44336"
+  },
+  "workbench.colorTheme": "Cold Python Theme",
+  "workbench.editor.editorActionsLocation": "titleBar",
+  "workbench.secondarySideBar.defaultVisibility": "visible",
+  "workbench.sideBar.location": "left",
+  "workbench.iconTheme": "cold-python-dark-icon-theme",
+  "gitlens.ai.model": "vscode",
+  "gitlens.ai.vscode.model": "copilot:gpt-4.1",
+  "yaml.disableSchemaDetection": [
+    "**/.github/workflows/*.yml",
+    "**/.github/workflows/*.yaml",
+    "**/.gitea/workflows/*.yml",
+    "**/.gitea/workflows/*.yaml",
+    "**/.forgejo/workflows/*.yml",
+    "**/.forgejo/workflows/*.yaml"
+  ],
+}
