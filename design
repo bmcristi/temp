@@ -1,0 +1,718 @@
+# Oracle GoldenGate CDC to Parquet — Design Overview
+
+## Table of contents
+
+1. [Architecture](#1-architecture)
+2. [Replicat strategy](#2-replicat-strategy)
+3. [Raw S3 layout and hourly partitioning](#3-raw-s3-layout-and-hourly-partitioning)
+4. [CDC event model](#4-cdc-event-model)
+5. [Raw CDC technical metadata](#5-raw-cdc-technical-metadata)
+6. [GoldenGate configuration](#6-goldengate-configuration)
+7. [Central ETL metadata table](#7-central-etl-metadata-table)
+8. [ETL metadata field definitions](#8-etl-metadata-field-definitions)
+9. [Spark processing and watermark advancement](#9-spark-processing-and-watermark-advancement)
+10. [Schema evolution](#10-schema-evolution)
+
+---
+
+## 1. Architecture
+
+```text
+Oracle Database
+    ↓
+GoldenGate Extract
+    ↓
+GoldenGate Trail
+    ↓
+GoldenGate Replicat
+    ↓
+Hourly Parquet partitions in private S3
+    ↓
+Spark ingestion
+    ↓
+Bronze Iceberg CDC tables
+    ↓
+Current-state, SCD2 and bitemporal curated tables
+```
+
+The raw S3 layer is append-only and stores inserts, updates, deletes and truncates as CDC events.
+
+GoldenGate uses three internal steps when producing Parquet in S3:
+
+1. File Writer generates local files.
+2. Parquet Event Handler converts the files to Parquet.
+3. S3 Event Handler uploads the Parquet files.
+
+The Parquet Event Handler requires Avro OCF as its internal input. Avro is therefore a temporary GoldenGate implementation detail and is not exposed as a data-lake storage layer.
+
+**Oracle verification**
+
+* [Realtime Parquet ingestion into AWS S3](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/qs-realtime-parquet-ingestion-aws-s3-buckets-goldengate-daa-23.8-and-later.html)
+* [File Writer and Parquet Event Handler](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/flat-files.html)
+
+---
+
+## 2. Replicat strategy
+
+Start with:
+
+```text
+One Classic Replicat for the Oracle CDC workload
+```
+
+The initial Replicat can process all approximately 50 tables.
+
+Do not create one Replicat per table.
+
+Classic Replicat is single-threaded. Coordinated Replicat uses multiple threads and can apply transactions in parallel. Start with Classic Replicat, measure lag and throughput, and introduce additional or Coordinated Replicats only when required.
+
+Split the workload later when:
+
+* Replicat lag exceeds the agreed SLA;
+* JVM memory pressure occurs;
+* several high-volume tables dominate the workload;
+* separate failure domains are required;
+* different table groups need significantly different file-roll settings.
+
+A possible later split is:
+
+```text
+REP_TRADE_HIGH_VOLUME
+    TRADES
+    ORDERS
+    EXECUTIONS
+    FILLS
+
+REP_TRADE_STANDARD
+    Remaining tables
+```
+
+The split should be based on measured workload rather than database-table count.
+
+**Oracle verification**
+
+* [Classic and Coordinated Replicat](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/qs-realtime-parquet-ingestion-aws-s3-buckets-goldengate-daa-23.8-and-later.html)
+* [Cloud Object Storage performance considerations](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/cloud-object-storage-replication.html)
+
+---
+
+## 3. Raw S3 layout and hourly partitioning
+
+```text
+s3://<raw-bucket>/
+  oracle-cdc/
+    dptf_source_system=oracle_trade/
+      dptf_source_database=trading_prod/
+        dptf_source_schema=TRADE/
+          dptf_source_table=EXECUTIONS/
+            dptf_ingest_date=2026-07-24/
+              dptf_ingest_hour=12/
+                *.parquet
+```
+
+GoldenGate requires File Writer partitioning to first separate data by table before additional partition levels are applied.
+
+The resolved File Writer partition path is propagated to the Parquet and S3 Event Handlers.
+
+The partition fields are:
+
+| Field                  | Description                                                       |
+| ---------------------- | ----------------------------------------------------------------- |
+| `dptf_source_system`   | Stable logical source-system identifier, such as `oracle_trade`.  |
+| `dptf_source_database` | Stable Oracle database or PDB identifier, such as `trading_prod`. |
+| `dptf_source_schema`   | Oracle schema containing the source table.                        |
+| `dptf_source_table`    | Oracle source-table name.                                         |
+| `dptf_ingest_date`     | UTC date when GoldenGate processed the event.                     |
+| `dptf_ingest_hour`     | UTC hour when GoldenGate processed the event, from `00` to `23`.  |
+
+The hourly partition is based on GoldenGate processing time, not Oracle business time or Oracle commit time.
+
+The original source-operation timestamp remains stored inside every CDC event as:
+
+```text
+dptf_source_operation_ts
+```
+
+Hourly partitioning does not mean one file per hour. GoldenGate can roll multiple files inside the same hourly partition.
+
+Recommended starting values:
+
+```text
+Partition interval:         1 hour
+File-roll interval:         10 minutes
+Inactivity roll interval:   2 minutes
+Maximum staging file size:  256 MB
+Parquet compression:        Snappy
+Partition timezone:         UTC
+```
+
+`maxFileSize`, `fileRollInterval` and `inactivityRollInterval` are independent roll conditions. A file is rolled when an applicable condition is reached.
+
+**Oracle verification**
+
+* [File Writer partitioning](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/flat-files.html)
+* [File Writer roll configuration](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/flat-files.html)
+* [Amazon S3 Event Handler](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/amazon-s3.html)
+
+---
+
+## 4. CDC event model
+
+Use GoldenGate operation-oriented formatting:
+
+```properties
+gg.handler.filewriter.mode=op
+gg.handler.filewriter.format=avro_op_ocf
+```
+
+Oracle describes `avro_op` as the verbose operation-oriented format. The OCF variant is required when the output is subsequently converted by the Parquet Event Handler.
+
+The conceptual CDC event contains:
+
+```text
+dptf_source_system
+dptf_source_database
+dptf_source_schema
+dptf_source_table
+dptf_source_object
+
+dptf_operation_type
+dptf_source_operation_ts
+dptf_ingestion_ts
+
+dptf_source_csn
+dptf_source_transaction_id
+dptf_transaction_operation_seq
+dptf_trail_position
+
+dptf_primary_keys
+dptf_schema_changed
+dptf_replicat_group
+
+before image
+after image
+```
+
+The operation images are:
+
+| Operation |        Before image |    After image |
+| --------- | ------------------: | -------------: |
+| Insert    |      Not applicable | New row values |
+| Update    | Previous row values | New row values |
+| Delete    |  Deleted row values | Not applicable |
+| Truncate  |      Not applicable | Not applicable |
+
+Oracle’s operation-format examples show updates with `before.*` and `after.*` values and deletes with the before image.
+
+For a primary-key update, use:
+
+```properties
+gg.handler.filewriter.format.pkUpdateHandling=delete-insert
+```
+
+This represents the change as:
+
+```text
+DELETE old primary key
+INSERT new primary key
+```
+
+**Oracle verification**
+
+* [Pluggable formatters and operation formatting](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/additional-details.html)
+* [Supported File Writer formats](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/flat-files.html)
+* [Primary-key update handling](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/cloud-object-storage-replication.html)
+
+---
+
+## 5. Raw CDC technical metadata
+
+The `dptf_` prefix identifies data-platform technical fields and prevents confusion with source columns that may have technical-sounding business names.
+
+### 5.1 Metadata configuration
+
+```properties
+gg.handler.filewriter.format.metaColumnsTemplate=\
+${static[dptf_source_system].oracle_trade},\
+${static[dptf_source_database].trading_prod},\
+${schema[dptf_source_schema]},\
+${table[dptf_source_table]},\
+${objectname[dptf_source_object]},\
+${optype[dptf_operation_type]},\
+${timestamp[dptf_source_operation_ts]},\
+${currenttimestampiso8601[dptf_ingestion_ts]},\
+${csn[dptf_source_csn]},\
+${xid[dptf_source_transaction_id]},\
+${opseqno[dptf_transaction_operation_seq]},\
+${position[dptf_trail_position]},\
+${primarykeysmap[dptf_primary_keys]},\
+${metadatachanged[dptf_schema_changed]},\
+${groupname[dptf_replicat_group]}
+```
+
+From GoldenGate 21.1 onward, metacolumn output must be explicitly configured through `format.metaColumnsTemplate`. The field name inside brackets defines the output name, allowing the use of the `dptf_` prefix.
+
+### 5.2 Source-identification fields
+
+| Field                  | Type   | Description                                                                      |
+| ---------------------- | ------ | -------------------------------------------------------------------------------- |
+| `dptf_source_system`   | String | Platform-defined identifier for the originating system. Example: `oracle_trade`. |
+| `dptf_source_database` | String | Platform-defined Oracle database or PDB identifier. Example: `trading_prod`.     |
+| `dptf_source_schema`   | String | Oracle source schema. Generated from `${schema}`.                                |
+| `dptf_source_table`    | String | Oracle source table. Generated from `${table}`.                                  |
+| `dptf_source_object`   | String | Fully qualified source-object name. Generated from `${objectname}`.              |
+
+Oracle defines `${schema}`, `${table}` and `${objectname}` as template/metacolumn keywords.
+
+### 5.3 Operation and ordering fields
+
+| Field                            | Type      | Description                                                                                                                                                          |
+| -------------------------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dptf_operation_type`            | String    | Source operation. Standard values are `I`, `U`, `D` and `T`.                                                                                                         |
+| `dptf_source_operation_ts`       | Timestamp | Timestamp carried in the trail record. All operations in the same unbatched transaction normally share this timestamp. It remains stable when the trail is replayed. |
+| `dptf_ingestion_ts`              | Timestamp | Time the GoldenGate formatter processed the operation. This may change when a trail record is replayed.                                                              |
+| `dptf_source_csn`                | String    | Source Commit Sequence Number representing the source commit-ordering point.                                                                                         |
+| `dptf_source_transaction_id`     | String    | Source Oracle transaction identifier.                                                                                                                                |
+| `dptf_transaction_operation_seq` | Long      | Sequence number of the operation within its source transaction.                                                                                                      |
+| `dptf_trail_position`            | String    | GoldenGate trail location. Oracle defines this as a 20-character value containing the trail sequence number and RBA.                                                 |
+| `dptf_primary_keys`              | Map       | Map whose keys are primary-key column names and whose values are their string representations.                                                                       |
+| `dptf_schema_changed`            | Boolean   | `true` on the first operation following a source-table metadata change.                                                                                              |
+| `dptf_replicat_group`            | String    | Name of the Replicat process that produced the event.                                                                                                                |
+
+Oracle directly defines:
+
+* `${csn}` as the Source Commit Sequence Number;
+* `${xid}` as the source transaction ID;
+* `${opseqno}` as the record sequence within the transaction;
+* `${position}` as the source trail position;
+* `${primarykeysmap}` as the map of primary-key names and values;
+* `${metadatachanged}` as the first-operation-after-schema-change indicator;
+* `${groupname}` as the Replicat group name.
+
+### 5.4 Before, after and missing values
+
+GoldenGate operation formatting exposes values from before and after the operation.
+
+GoldenGate can also emit:
+
+```text
+<column>_isMissing
+```
+
+when configured with:
+
+```properties
+gg.handler.filewriter.format.includeIsMissingFields=true
+```
+
+This distinguishes an explicit Oracle `NULL` from a column absent from the trail image.
+
+```text
+PRICE = NULL
+PRICE_isMissing = false
+```
+
+means that the source value was explicitly null.
+
+```text
+PRICE = NULL
+PRICE_isMissing = true
+```
+
+means that the column was not present in the captured row image.
+
+The property is optional and defaults to `false`.
+
+### 5.5 Spark-derived fields
+
+| Field                    | Type      | Description                                                   |
+| ------------------------ | --------- | ------------------------------------------------------------- |
+| `dptf_event_id`          | String    | Deterministic event identifier used for replay deduplication. |
+| `dptf_processing_run_id` | String    | Identifier of the Spark run that processed the event.         |
+| `dptf_processed_at`      | Timestamp | UTC timestamp when Spark successfully processed the event.    |
+
+Recommended event identifier:
+
+```text
+SHA-256(
+    dptf_source_system
+    + dptf_source_database
+    + dptf_source_object
+    + dptf_trail_position
+    + dptf_transaction_operation_seq
+    + dptf_operation_type
+)
+```
+
+`dptf_ingestion_ts` is not included because GoldenGate’s current formatter timestamp can change when a trail record is replayed. The trail operation timestamp and trail position are stable for the original trail record.
+
+**Oracle verification**
+
+* [GoldenGate metacolumn keywords](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/additional-details.html)
+* [Operation formatter metadata](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/additional-details.html)
+* [Primary-key map definition](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/additional-details.html)
+* [Missing-field handling](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/additional-details.html)
+
+---
+
+## 6. GoldenGate configuration
+
+### 6.1 Source supplemental logging
+
+The final supplemental-logging settings must be agreed with the Oracle DBA and tested for redo-volume impact.
+
+Example:
+
+```text
+DBLOGIN USERIDALIAS <source-alias>
+
+ADD TRANDATA TRADE.EXECUTIONS ALLCOLS
+ADD TRANDATA TRADE.ORDERS ALLCOLS
+ADD TRANDATA TRADE.TRADES ALLCOLS
+```
+
+Use full supplemental column logging only where the CDC event contract requires complete before and after images.
+
+**Oracle verification**
+
+* [Oracle transaction-log requirements](https://docs.oracle.com/en/database/goldengate/core/26/coredoc/prepare-transaction-logs-settings-and-requirements-ogg-oracle.html)
+* [LOGALLSUPCOLS](https://docs.oracle.com/en/database/goldengate/core/26/reference/logallsupcols.html)
+
+### 6.2 Extract configuration
+
+```text
+EXTRACT EXTTRADE
+
+USERIDALIAS <source-alias>
+EXTTRAIL ./dirdat/rt
+
+LOGALLSUPCOLS
+UPDATERECORDFORMAT FULL
+TRANLOGOPTIONS TRACKSCHEMACHANGES
+
+TABLE TRADE.EXECUTIONS;
+TABLE TRADE.ORDERS;
+TABLE TRADE.TRADES;
+TABLE TRADE.FILLS;
+TABLE TRADE.POSITIONS;
+TABLE TRADE.SETTLEMENTS;
+```
+
+`UPDATERECORDFORMAT FULL` controls whether update before and after images are stored together in one trail record.
+
+`TRACKSCHEMACHANGES` enables source table-level schema changes to be tracked and updates the trail metadata as appropriate. Oracle states that this option is enabled by default from GoldenGate 23.7 onward, but it may still be stated explicitly for clarity.
+
+**Oracle verification**
+
+* [UPDATERECORDFORMAT](https://docs.oracle.com/en/database/goldengate/core/26/reference/updaterecordformat.html)
+* [TRANLOGOPTIONS TRACKSCHEMACHANGES](https://docs.oracle.com/en/database/goldengate/core/26/reference/tranlogoptions.html)
+* [LOGALLSUPCOLS](https://docs.oracle.com/en/database/goldengate/core/26/reference/logallsupcols.html)
+* [EXTTRAIL](https://docs.oracle.com/en/database/goldengate/core/26/reference/exttrail.html)
+
+### 6.3 Replicat configuration
+
+```text
+REPLICAT REPTRDS3
+
+TARGETDB LIBFILE libggjava.so
+SET property=/path/REPTRDS3.properties
+
+GROUPTRANSOPS 5000
+
+MAP TRADE.EXECUTIONS, TARGET TRADE.EXECUTIONS;
+MAP TRADE.ORDERS, TARGET TRADE.ORDERS;
+MAP TRADE.TRADES, TARGET TRADE.TRADES;
+MAP TRADE.FILLS, TARGET TRADE.FILLS;
+MAP TRADE.POSITIONS, TARGET TRADE.POSITIONS;
+MAP TRADE.SETTLEMENTS, TARGET TRADE.SETTLEMENTS;
+```
+
+The exact `GROUPTRANSOPS` value must be load-tested. Oracle identifies Replicat type, transaction grouping and generated file size as related Cloud Object Storage performance controls.
+
+**Oracle verification**
+
+* [Cloud Object Storage performance considerations](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/cloud-object-storage-replication.html)
+* [S3 Parquet Replicat quickstart](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/qs-realtime-parquet-ingestion-aws-s3-buckets-goldengate-daa-23.8-and-later.html)
+* [TABLE and MAP](https://docs.oracle.com/en/database/goldengate/core/26/reference/table-map.html)
+
+### 6.4 Java handler properties
+
+```properties
+gg.handlerlist=filewriter
+
+# File Writer
+gg.handler.filewriter.type=filewriter
+gg.handler.filewriter.mode=op
+gg.handler.filewriter.format=avro_op_ocf
+gg.handler.filewriter.partitionByTable=true
+
+gg.handler.filewriter.pathMappingTemplate=./dirout/${fullyQualifiedTableName}
+gg.handler.filewriter.stateFileDirectory=./dirsta
+gg.handler.filewriter.fileWriteActiveSuffix=.tmp
+
+gg.handler.filewriter.maxFileSize=256m
+gg.handler.filewriter.fileRollInterval=10m
+gg.handler.filewriter.inactivityRollInterval=2m
+gg.handler.filewriter.rollOnShutdown=true
+gg.handler.filewriter.finalizeAction=delete
+
+gg.handler.filewriter.format.pkUpdateHandling=delete-insert
+gg.handler.filewriter.format.includeIsMissingFields=true
+gg.handler.filewriter.format.enableTimestampLogicalType=true
+gg.handler.filewriter.format.enableDecimalLogicalType=true
+gg.format.timestamp=yyyy-MM-dd HH:mm:ss.SSSSSS
+
+gg.handler.filewriter.format.metaColumnsTemplate=\
+${static[dptf_source_system].oracle_trade},\
+${static[dptf_source_database].trading_prod},\
+${schema[dptf_source_schema]},\
+${table[dptf_source_table]},\
+${objectname[dptf_source_object]},\
+${optype[dptf_operation_type]},\
+${timestamp[dptf_source_operation_ts]},\
+${currenttimestampiso8601[dptf_ingestion_ts]},\
+${csn[dptf_source_csn]},\
+${xid[dptf_source_transaction_id]},\
+${opseqno[dptf_transaction_operation_seq]},\
+${position[dptf_trail_position]},\
+${primarykeysmap[dptf_primary_keys]},\
+${metadatachanged[dptf_schema_changed]},\
+${groupname[dptf_replicat_group]}
+
+# Hourly table partitioning
+gg.handler.filewriter.partitioner.TRADE.EXECUTIONS=\
+dptf_ingest_date=${currentTimestamp[yyyy-MM-dd]}/\
+dptf_ingest_hour=${currentTimestamp[HH]}
+
+gg.handler.filewriter.partitioner.TRADE.ORDERS=\
+dptf_ingest_date=${currentTimestamp[yyyy-MM-dd]}/\
+dptf_ingest_hour=${currentTimestamp[HH]}
+
+# Parquet
+gg.handler.filewriter.eventHandler=parquet
+
+gg.eventhandler.parquet.type=parquet
+gg.eventhandler.parquet.writeToHDFS=false
+gg.eventhandler.parquet.pathMappingTemplate=./dirparquet
+gg.eventhandler.parquet.compressionCodec=SNAPPY
+gg.eventhandler.parquet.finalizeAction=delete
+gg.eventhandler.parquet.eventHandler=s3
+
+# S3
+gg.eventhandler.s3.type=s3
+gg.eventhandler.s3.region=<region>
+gg.eventhandler.s3.url=https://<private-s3-endpoint>
+gg.eventhandler.s3.bucketMappingTemplate=<raw-bucket>
+
+gg.eventhandler.s3.pathMappingTemplate=\
+oracle-cdc/\
+dptf_source_system=oracle_trade/\
+dptf_source_database=trading_prod/\
+dptf_source_schema=${schemaName}/\
+dptf_source_table=${tableName}
+
+gg.eventhandler.s3.enableBucketAdmin=false
+gg.eventhandler.s3.purgeTargetPathOnStartup=false
+gg.eventhandler.s3.multipartEnabled=false
+```
+
+Oracle documents:
+
+* File Writer handler and roll properties;
+* File Writer table partitioning;
+* the Avro OCF requirement for Parquet conversion;
+* Parquet Event Handler configuration;
+* S3 bucket, path and private endpoint properties;
+* S3 encryption, credentials and multipart-upload properties.
+
+`enableTimestampLogicalType=true` prevents source DATE and TIMESTAMP values from being written as plain strings and maps them using timestamp logical types.
+
+The decimal configuration must be validated against Oracle `NUMBER` definitions, especially for financial values. Oracle warns that restrictive precision settings can cause Replicat to ABEND when source values exceed the configured precision.
+
+**Oracle verification**
+
+* [File Writer configuration](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/flat-files.html)
+* [Parquet Event Handler](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/flat-files.html)
+* [Amazon S3 Event Handler](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/amazon-s3.html)
+* [Cloud Object Storage type mappings](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/cloud-object-storage-replication.html)
+* [GoldenGate metacolumns](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/additional-details.html)
+
+---
+
+## 7. Central ETL metadata table
+
+The platform maintains one row per ETL pipeline:
+
+```sql
+CREATE TABLE platform_control.dptf_pipeline_metadata (
+    dptf_pipeline_id                       STRING NOT NULL,
+    dptf_pipeline_name                     STRING,
+
+    dptf_last_run_id                       STRING,
+    dptf_last_run_status                   STRING,
+    dptf_last_run_time                     TIMESTAMP,
+
+    dptf_last_processed_partition_time     TIMESTAMP,
+    dptf_partition_format                  STRING NOT NULL,
+    dptf_partition_timezone                STRING NOT NULL,
+
+    dptf_source_ids                        ARRAY<STRING>,
+    dptf_target_ids                        ARRAY<STRING>,
+
+    dptf_created_at                        TIMESTAMP NOT NULL,
+    dptf_updated_at                        TIMESTAMP NOT NULL
+)
+USING iceberg;
+```
+
+Logical primary key:
+
+```text
+dptf_pipeline_id
+```
+
+This table is a data-platform design, not an Oracle GoldenGate system table. Oracle GoldenGate does not prescribe this ETL metadata schema.
+
+---
+
+## 8. ETL metadata field definitions
+
+| Field                                | Description                                                                                                                       |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| `dptf_pipeline_id`                   | Stable unique identifier for the ETL pipeline. Example: `oracle_trade_executions_raw_to_bronze`.                                  |
+| `dptf_pipeline_name`                 | Human-readable name used in monitoring and reporting.                                                                             |
+| `dptf_last_run_id`                   | Identifier of the latest pipeline execution attempt. It may logically reference a separate run-statistics table.                  |
+| `dptf_last_run_status`               | Status of the latest execution. Recommended values: `RUNNING`, `SUCCESS`, `FAILED`, `CANCELLED` and `SKIPPED`.                    |
+| `dptf_last_run_time`                 | Actual UTC start time of the latest pipeline execution. It is not the data watermark.                                             |
+| `dptf_last_processed_partition_time` | Start timestamp of the latest successfully processed partition.                                                                   |
+| `dptf_partition_format`              | Partition granularity used to calculate the next partition. Recommended values: `HOURLY`, `DAILY`, `WEEKLY`, `MONTHLY` or `NONE`. |
+| `dptf_partition_timezone`            | Timezone used to interpret partition boundaries. Recommended value: `UTC`.                                                        |
+| `dptf_source_ids`                    | Stable logical identifiers for datasets read by the pipeline.                                                                     |
+| `dptf_target_ids`                    | Stable logical identifiers for datasets written by the pipeline.                                                                  |
+| `dptf_created_at`                    | UTC timestamp when the metadata row was inserted. Set automatically and never changed.                                            |
+| `dptf_updated_at`                    | UTC timestamp when the metadata row was most recently changed. Set automatically on updates.                                      |
+
+Example:
+
+```text
+dptf_pipeline_id:
+oracle_trade_executions_raw_to_bronze
+
+dptf_last_run_id:
+cbd1e4a9-8d42-4d2f-9f17-7ab6e03eb10a
+
+dptf_last_run_status:
+SUCCESS
+
+dptf_last_run_time:
+2026-07-24 13:35:12 UTC
+
+dptf_last_processed_partition_time:
+2026-07-24 12:00:00 UTC
+
+dptf_partition_format:
+HOURLY
+
+dptf_partition_timezone:
+UTC
+
+dptf_source_ids:
+["s3.raw.oracle_trade.TRADE.EXECUTIONS"]
+
+dptf_target_ids:
+["iceberg.bronze_trade.executions_cdc"]
+```
+
+This metadata table is platform-defined and therefore has no corresponding Oracle GoldenGate documentation page.
+
+---
+
+## 9. Spark processing and watermark advancement
+
+For every pipeline execution:
+
+1. Read the pipeline metadata row.
+2. Read `dptf_last_processed_partition_time`.
+3. Calculate the next partition using `dptf_partition_format`.
+4. Read the new partition and the configured lookback partitions.
+5. Calculate `dptf_event_id`.
+6. Deduplicate against the Bronze Iceberg CDC table.
+7. Commit the Bronze write.
+8. Advance the watermark only after the Bronze write succeeds.
+
+For:
+
+```text
+dptf_last_processed_partition_time =
+2026-07-24 12:00:00 UTC
+
+dptf_partition_format =
+HOURLY
+```
+
+the successfully processed interval is:
+
+```text
+[2026-07-24 12:00:00, 2026-07-24 13:00:00)
+```
+
+The next partition is:
+
+```text
+2026-07-24 13:00:00 UTC
+```
+
+The watermark represents the partition start time. It does not represent:
+
+* the pipeline execution time;
+* the maximum source-event timestamp;
+* the Oracle commit timestamp;
+* the most recent S3 file modification time.
+
+GoldenGate S3 delivery uses at-least-once semantics during failure recovery. A failure between S3 upload and checkpoint advancement can cause records to be replayed. Spark must therefore perform deterministic event-level deduplication.
+
+The design intentionally rereads a small number of previous hourly partitions instead of maintaining an S3 file manifest.
+
+**Oracle verification**
+
+* [S3 delivery and duplicate records after Replicat recovery](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/amazon-s3.html)
+* [Trail position and stable operation metadata](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/additional-details.html)
+
+---
+
+## 10. Schema evolution
+
+GoldenGate tracks table metadata versions in the trail when schema tracking is enabled.
+
+When metadata changes while File Writer is active, GoldenGate rolls the current file so subsequent output can use the updated table metadata.
+
+The expected Spark handling is:
+
+```text
+Nullable column addition:
+    Extend the Bronze schema.
+
+Compatible numeric or timestamp widening:
+    Cast to the approved Bronze type.
+
+Column rename:
+    Apply an explicit mapping.
+
+Column drop:
+    Apply a controlled schema deployment.
+
+Incompatible type change:
+    Stop or quarantine processing until an explicit mapping is approved.
+```
+
+`dptf_schema_changed=true` identifies the first event after the source-table metadata definition changed.
+
+It does not describe which column changed or whether the change is compatible.
+
+Because multiple Parquet files can have different schemas, Spark must normalize the files into the approved Bronze Iceberg schema.
+
+**Oracle verification**
+
+* [TRANLOGOPTIONS TRACKSCHEMACHANGES](https://docs.oracle.com/en/database/goldengate/core/26/reference/tranlogoptions.html)
+* [File Writer behaviour and file rolling](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/flat-files.html)
+* [GoldenGate metadata-change indicator](https://docs.oracle.com/en/database/goldengate/big-data/26/gadbd/additional-details.html)
