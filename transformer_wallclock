@@ -1,0 +1,117 @@
+package com.expenti.kafka.connect.smt;
+
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.data.Timestamp;
+import org.apache.kafka.connect.errors.DataException;
+import org.apache.kafka.connect.transforms.Transformation;
+import org.apache.kafka.connect.transforms.util.Requirements;
+import org.apache.kafka.connect.transforms.util.SimpleConfig;
+
+import java.time.Instant;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * InsertCurrentTimestamp$Value
+ * Adds a wall-clock timestamp field to the record value.
+ * - Default field name: dptf_write_ts
+ * - Type: Connect Timestamp (java.util.Date)
+ */
+public class WallClockTimestampSMT<R extends ConnectRecord<R>> implements Transformation<R> {
+
+  public static final String FIELD_CONFIG = "field";
+
+  private static final ConfigDef CONFIG_DEF = new ConfigDef()
+      .define(FIELD_CONFIG, ConfigDef.Type.STRING, "dptf_write_ts",
+          ConfigDef.Importance.HIGH, "Field name to insert on the record value.");
+
+  private String fieldName;
+
+  // cache updated schemas keyed by original schema instance
+  private final Map<Schema, Schema> schemaCache = new ConcurrentHashMap<>();
+
+  @Override
+  public void configure(Map<String, ?> configs) {
+    SimpleConfig c = new SimpleConfig(CONFIG_DEF, configs);
+    fieldName = c.getString(FIELD_CONFIG);
+  }
+
+  @Override
+  public R apply(R record) {
+    final Object value = record.value();
+    if (value == null)
+      return record;
+
+    Date now = Date.from(Instant.now()); // UTC instant converted to Date
+
+    final Schema schema = record.valueSchema();
+    if (schema == null) {
+      if (!(value instanceof Map)) {
+        throw new DataException("Schemaless record must have Map value");
+      }
+      @SuppressWarnings("unchecked")
+      Map<String, Object> original = (Map<String, Object>) value;
+      Map<String, Object> updated = new HashMap<>(original);
+      updated.put(fieldName, now);
+      return record.newRecord(
+          record.topic(), record.kafkaPartition(),
+          record.keySchema(), record.key(),
+          null, updated,
+          record.timestamp());
+    }
+
+    final Struct struct = Requirements.requireStruct(value, "Insert current timestamp");
+    final boolean hasField = schema.field(fieldName) != null;
+    final Schema updatedSchema = hasField ? schema : schemaCache.computeIfAbsent(schema, this::addFieldToSchema);
+    final Struct updated = new Struct(updatedSchema);
+
+    for (Field f : schema.fields()) {
+      updated.put(f.name(), struct.get(f));
+    }
+    updated.put(fieldName, now);
+
+    return record.newRecord(
+        record.topic(), record.kafkaPartition(),
+        record.keySchema(), record.key(),
+        updatedSchema, updated,
+        record.timestamp());
+  }
+
+  private Schema addFieldToSchema(Schema original) {
+    if (original.type() != Schema.Type.STRUCT) {
+      throw new DataException("Only STRUCT value schemas are supported");
+    }
+    SchemaBuilder b = SchemaBuilder.struct()
+        .name(original.name())
+        .version(original.version())
+        .doc(original.doc());
+
+    // copy parameters (if any)
+    if (original.parameters() != null) {
+      original.parameters().forEach(b::parameter);
+    }
+    // copy fields
+    for (Field f : original.fields()) {
+      b.field(f.name(), f.schema());
+    }
+    // add our field as OPTIONAL Timestamp to be lenient
+    b.field(fieldName, Timestamp.builder().optional().build());
+    return b.build();
+  }
+
+  @Override
+  public ConfigDef config() {
+    return CONFIG_DEF;
+  }
+
+  @Override
+  public void close() {
+    /* no-op */ }
+}
