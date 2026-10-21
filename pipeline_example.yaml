@@ -1,0 +1,76 @@
+# demo pipeline showcasing debezium postgres source and iceberg sink
+pipeline_uuid: "demo_debezium_aws_postgres_test"
+data_asset:
+  domain: "demo"
+  name: "test_dbz_pg"
+  description: "Test Debezium Postgres connector with AWS Postgres"
+  version:
+    major: 1
+    minor: 0
+    patch: 0
+  stewards:
+    - team_id: "data-platform"
+      emails:
+        - "cboizas@weshape.io"
+        - "mchen@expenti.com"
+time_partitioning: "hourly"
+pipeline_type: "kafka_connect"
+ingestion_layers:
+  source_layer:
+    connector:
+      type: "debezium_postgres_source"
+      config:
+        host: "test-debezium.c7sgqu0w43vg.eu-west-1.rds.amazonaws.com"
+        port: "9094"
+        database_name: "postgres"
+        database_server_name: "postgres-test-debezium"
+        table_include_list: "public.employees"
+        slot_name: "debezium_slot"
+        publication_name: "debezium_pub"
+        publication_auto_create_mode: "disabled"
+        plugin_name: "pgoutput"
+        snapshot_mode: "when_needed"
+        include_schema_changes: "true"
+        secrets_type: "env_vars"
+        credentials:
+          connection_id: "test_debezium_postgres"
+          properties:
+            username: "debezium" # this is just a test db without any meaningful data, normally we will use obfuscated credentials
+            password: "debezium"
+      connector_config_overrides:
+        errors.tolerance: "all"
+        errors.log.enable: "true"
+        errors.log.include.messages: "true"
+      provisioned_capacity:
+        mcu_count: 1
+        worker_count: 1
+  raw_layer:
+    connector:
+      type: "s3_sink"
+      config:
+        kafka_dlq: false
+        store_dlq: false
+      connector_config_overrides:
+        flush.size: "10"
+        flush.interval.ms: "1000"
+        rotate.interval.ms: "1000"
+        topics: "topic_dbz__demo__test_dbz_pg.public.employees" # Need to overwrite the default topic name as debezium uses a different convention 
+        # For topics use: topic_prefix (topic_dbz__) + data_asset.id (domain__name) + ".db" + ".table_name"
+  staging_layer: # configuration for staging layer if it needs to be created/updated
+    connector:
+      type: "iceberg_sink"
+      config:
+        auto_create_table: true #NOT IMPLEMENTED (default is true)
+        extra_field_partitioning: #NOT IMPLEMENTED
+      connector_config_overrides:
+        topics: "topic_dbz__demo__test_dbz_pg.public.employees" # Need to overwrite the default topic name as debezium uses a different convention
+        flush.size: "10"
+        flush.interval.ms: "1000"
+        rotate.interval.ms: "1000"
+        iceberg.control.commit.interval-ms: "30000" # 30 seconds
+      autoscaling_capacity:
+        min_worker_count: 1
+        max_worker_count: 10
+        mcu_count: 2
+        scale_in_cpu_util: 40
+        scale_out_cpu_util: 80
